@@ -155,7 +155,7 @@ function fieldChanges(before, after, groups) {
 }
 
 const COMPONENT_FIELDS = {
-  semantic: ['type', 'label', 'sublabel', 'tag'],
+  semantic: ['type', 'label', 'sublabel', 'tag', 'brand'],
   evidence: ['sources'],
   geometry: ['row', 'col', 'pos', 'size'],
 };
@@ -371,7 +371,11 @@ function addNodeMarker(group, state) {
   if (!symbol) return group;
   const box = group.match(/<rect x="([^"]+)" y="([^"]+)" width="([^"]+)"/);
   if (!box) return group;
-  const x = Number(box[1]) + Number(box[3]) - 9;
+  const branded = group.includes('class="brand-mark"');
+  // Leave the two 16px corner badges clear. On a narrow branded node, the
+  // outline and exact change row identify the change without another symbol.
+  if (branded && Number(box[3]) < 64) return group;
+  const x = Number(box[1]) + Number(box[3]) - (branded ? 33 : 9);
   const y = Number(box[2]) + 9;
   return group.replace(/<\/g>$/, `\n          <g class="delta-node-marker" aria-hidden="true"><circle cx="${x}" cy="${y}" r="8"/><text x="${x}" y="${y + 3}" text-anchor="middle">${symbol}</text></g>\n        </g>`);
 }

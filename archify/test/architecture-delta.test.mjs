@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseFragment } from 'parse5';
 import {
   ArchitectureDeltaError,
   architectureDeltaChangeRows,
@@ -94,6 +95,114 @@ test('legend-only changes are presentation changes and never topology changes', 
     rerouted: 0,
   });
   assert.deepEqual(receipt.changes, { components: [], connections: [], boundaries: [] });
+});
+
+for (const { name, before, after, move = false, width = 160 } of [
+  { name: 'addition', after: 'postgresql' },
+  { name: 'removal', before: 'postgresql' },
+  { name: 'replacement', before: 'postgresql', after: 'mysql' },
+  { name: 'replacement with movement', before: 'postgresql', after: 'mysql', move: true },
+  { name: 'replacement at the marker width floor', before: 'postgresql', after: 'mysql', width: 64 },
+  { name: 'replacement on a narrow node', before: 'postgresql', after: 'mysql', width: 56 },
+]) {
+  test(`compare CLI reports a component brand ${name} as an authored change`, () => {
+    const label = width < 160 ? 'D' : 'Store';
+    const diagram = (brand, moved = false) => ({
+      schema_version: 1,
+      diagram_type: 'architecture',
+      meta: { title: 'Storage migration', viewBox: [640, 280] },
+      components: [
+        { id: 'api', type: 'backend', label: 'API', pos: [60, 100], size: [160, 72] },
+        {
+          id: 'store', type: 'database', label,
+          pos: [moved ? 420 : 400, 100], size: [width, 72],
+          ...(brand ? { brand } : {}),
+        },
+      ],
+      connections: [{ id: 'query', from: 'api', to: 'store', label: 'query' }],
+    });
+    const basePath = path.join(tmp, `brand-${name}.base.json`);
+    const headPath = path.join(tmp, `brand-${name}.head.json`);
+    const output = path.join(tmp, `brand-${name}.html`);
+    fs.writeFileSync(basePath, JSON.stringify(diagram(before)));
+    fs.writeFileSync(headPath, JSON.stringify(diagram(after, move)));
+
+    const result = run(['compare', 'architecture', basePath, headPath, output, '--json']);
+    assert.equal(result.status, 0, result.stderr);
+    const receipt = JSON.parse(result.stdout);
+    assert.deepEqual(receipt.changes, {
+      components: [{
+        id: 'store', baseLabel: label, headLabel: label, status: 'changed',
+        classifications: move ? ['geometry', 'semantic'] : ['semantic'],
+        changedFields: move ? ['/brand', '/pos'] : ['/brand'],
+      }],
+      connections: [],
+      boundaries: [],
+    });
+    assert.deepEqual(receipt.summary.components, {
+      added: 0, changed: 1, evidenceChanged: 0, removed: 0, moved: 0,
+    });
+    assert.equal(receipt.summary.presentationChanged, false);
+    assert.equal(receipt.summary.provenanceChanged, false);
+    const html = fs.readFileSync(output, 'utf8');
+    assert.equal(html.includes('data-change-key="component:store"'), true);
+    assert.equal(html.includes('No authored architecture changes.'), false);
+    assert.deepEqual(validateArchitectureDeltaHtml(html, receipt), { ok: true, checksPassed: 10, checkCount: 10 });
+    const delta = html.match(/<section class="canvas" data-view="delta">([\s\S]*?)<\/section>/)?.[1];
+    assert.ok(delta);
+    const attribute = (element, name) => element?.attrs?.find((entry) => entry.name === name)?.value;
+    const stores = [];
+    const visit = (element) => {
+      if (attribute(element, 'data-node-id') === 'store') stores.push(element);
+      for (const child of element.childNodes || []) visit(child);
+    };
+    visit(parseFragment(delta));
+    assert.equal(stores.length, move ? 2 : 1);
+    for (const store of stores) {
+      const brand = store.childNodes.find((element) => attribute(element, 'class') === 'brand-mark');
+      const marker = store.childNodes.find((element) => attribute(element, 'class') === 'delta-node-marker');
+      assert.equal(Boolean(marker), width >= 64);
+      if (!brand || !marker) continue;
+      const circle = marker.childNodes.find((element) => element.tagName === 'circle');
+      const [brandX, brandY] = attribute(brand, 'transform').match(/[-\d.]+/g).map(Number);
+      const [x, y, radius] = ['cx', 'cy', 'r'].map((name) => Number(attribute(circle, name)));
+      assert.ok(x + radius < brandX || x - radius > brandX + 16
+        || y + radius < brandY || y - radius > brandY + 16,
+      'a delta symbol must not obscure its node\'s authored brand');
+    }
+  });
+}
+
+test('architecture compare detects captured brand URL and digest changes', () => {
+  for (const field of ['url', 'sha256']) {
+    const base = read(baseFixture);
+    const head = read(baseFixture);
+    const brand = { url: 'https://partner.example.com', sha256: 'a'.repeat(64) };
+    base.components[0].brand = brand;
+    head.components[0].brand = {
+      ...brand,
+      [field]: field === 'url' ? 'https://other.example.com' : 'b'.repeat(64),
+    };
+    const receipt = compareArchitecture(base, head);
+    assert.equal(receipt.summary.components.changed, 1, field);
+    assert.deepEqual(receipt.changes.components[0].classifications, ['semantic']);
+    assert.deepEqual(receipt.changes.components[0].changedFields, ['/brand']);
+  }
+});
+
+test('architecture compare ignores unchanged brands and captured brand key order', () => {
+  for (const brand of ['postgresql', { url: 'https://partner.example.com', sha256: 'a'.repeat(64) }]) {
+    const base = read(baseFixture);
+    const head = read(baseFixture);
+    base.components[0].brand = brand;
+    head.components[0].brand = typeof brand === 'string'
+      ? brand
+      : { sha256: brand.sha256, url: brand.url };
+    const receipt = compareArchitecture(base, head);
+    assert.deepEqual(receipt.changes, { components: [], connections: [], boundaries: [] });
+    assert.equal(receipt.summary.presentationChanged, false);
+    assert.equal(canonicalArchitectureJson(base), canonicalArchitectureJson(head));
+  }
 });
 
 test('canonical architecture ignores formatting, entity order, and set-like order', () => {
